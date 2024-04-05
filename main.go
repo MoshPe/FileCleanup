@@ -17,7 +17,7 @@ const (
 	retentionDays           = 30
 	deleteIntervalSeconds   = 3600 // Change this to desired interval in seconds (e.g., 3600 for 1 hour)
 	maxFolderSizeMB         = 256  // Maximum folder size in MB
-	maxFolderSizePercent    = 70   // Maximum folder size as a percentage of the total drive size
+	maxFolderSizePercent    = 5    // Maximum folder size as a percentage of the total drive size
 	maxFolderPercentEnabled = true
 	checkSizeIntervalSecs   = 600 // Interval for checking folder size in seconds (e.g., 600 for every 10 minutes)
 	isDetailedLogEnabled    = false
@@ -148,6 +148,7 @@ func deleteOldFiles() {
 	mutex.Lock()
 	defer mutex.Unlock()
 
+	log.Println("Started processing deletion of old files...")
 	currentTime := time.Now()
 	deletedFiles := uint64(0)
 	if len(fileInfoMap) == 0 {
@@ -167,13 +168,14 @@ func deleteOldFiles() {
 			delete(fileInfoMap, path)
 		}
 	}
-	log.Println("Total deleted files", deletedFiles)
+	log.Printf("Total deleted files %d | Remaining folder size %d MB", deletedFiles, getFolderSizeMB())
 }
 
 func deleteExcessFiles() {
 	mutex.Lock()
 	defer mutex.Unlock()
 
+	log.Println("Started processing deletion of excess files...")
 	var folderSize int64
 	var maxFolderSize int64
 	var numFilesToDelete int64
@@ -264,7 +266,7 @@ func getFolderSizePercent() int64 {
 
 	// Calculate the folder size as a percentage of the total drive size
 	folderSizePercent := int((float64(folderSize) / float64(totalSize)) * 100)
-	log.Println("Folder size: ", folderSize/MB, "Total Drive size: ", totalSize/MB)
+	log.Printf("Folder size: %f GB | Total Drive size: %f GB", float64(folderSize)/GB, float64(totalSize)/GB)
 
 	return int64(folderSizePercent)
 }
