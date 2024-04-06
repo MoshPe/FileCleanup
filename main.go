@@ -1,23 +1,26 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/fsnotify/fsnotify"
 )
 
 const (
-	targetFolder            = "/home/mosheper/GolandProjects/FileCleanup/junkFiles"
+	targetFolder            = "E:/junkFiles"
 	retentionDays           = 30
 	deleteIntervalSeconds   = 3600 // Change this to desired interval in seconds (e.g., 3600 for 1 hour)
 	maxFolderSizeMB         = 256  // Maximum folder size in MB
-	maxFolderSizePercent    = 5    // Maximum folder size as a percentage of the total drive size
+	maxFolderSizePercent    = 0    // Maximum folder size as a percentage of the total drive size
 	maxFolderPercentEnabled = true
 	checkSizeIntervalSecs   = 600 // Interval for checking folder size in seconds (e.g., 600 for every 10 minutes)
 	isDetailedLogEnabled    = false
@@ -31,8 +34,8 @@ const (
 )
 
 var (
-	fileInfoMap  = make(map[string]FileInfo)
-	driveInfo    = &syscall.Statfs_t{}
+	fileInfoMap = make(map[string]FileInfo)
+	//driveInfo    = &syscall.Statfs_t{}
 	driveInfoSet sync.Once
 	mutex        sync.Mutex
 )
@@ -92,15 +95,16 @@ func main() {
 	defer sizeTicker.Stop()
 
 	// Run the deletion process immediately and then periodically
-	deleteOldFiles()
-	for {
-		select {
-		case <-ticker.C:
-			deleteOldFiles()
-		case <-sizeTicker.C:
-			go deleteExcessFiles()
-		}
-	}
+	deleteExcessFiles()
+	//deleteOldFiles()
+	//for {
+	//	select {
+	//	case <-ticker.C:
+	//		deleteOldFiles()
+	//	case <-sizeTicker.C:
+	//		go deleteExcessFiles()
+	//	}
+	//}
 	<-make(chan struct{})
 }
 
@@ -246,17 +250,45 @@ func getFileAvgSizeMB() int64 {
 }
 
 func getFolderSizePercent() int64 {
-	driveInfoSet.Do(func() {
-		path := filepath.Dir(targetFolder)
-		stat := syscall.Statfs_t{}
-		if err := syscall.Statfs(path, &stat); err != nil {
-			log.Fatalf("Failed to get file system information for %s: %v", path, err)
-		}
-		driveInfo = &stat
-	})
+	var totalSize int64
+	switch runtime.GOOS {
+	case "windows":
+		kernelDLL := syscall.MustLoadDLL("kernel32.dll")
+		GetDiskFreeSpaceExW := kernelDLL.MustFindProc("GetDiskFreeSpaceExW")
 
-	// Get the total size of the drive where the folder resides
-	totalSize := driveInfo.Blocks * uint64(driveInfo.Bsize)
+		var free, total, avail int64
+
+		path := "E:\\"
+		r1, r2, lastErr := GetDiskFreeSpaceExW.Call(
+			uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(path))),
+			uintptr(unsafe.Pointer(&free)),
+			uintptr(unsafe.Pointer(&total)),
+			uintptr(unsafe.Pointer(&avail)),
+		)
+
+		fmt.Println(r1, r2, lastErr)
+		fmt.Println("Free:", free, "Total:", total, "Available:", avail)
+		totalSize = total
+		break
+
+	case "linux":
+		//TODO think about what do to in here. Maybe dev in dev_container would solve it
+
+		//driveInfoSet.Do(func() {
+		//	path := filepath.Dir(targetFolder)
+		//	stat := syscall.Statfs_t{}
+		//	if err := syscall.Statfs(path, &stat); err != nil {
+		//		log.Fatalf("Failed to get file system information for %s: %v", path, err)
+		//	}
+		//	driveInfo = &stat
+		//})
+		//
+		//// Get the total size of the drive where the folder resides
+		//totalSize = driveInfo.Blocks * uint64(driveInfo.Bsize)
+		break
+	default:
+		log.Fatal("Unsupported platform.")
+	}
 
 	// Calculate the total size of all files in the folder
 	var folderSize int64

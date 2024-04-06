@@ -2,16 +2,19 @@ package main
 
 import (
 	"fmt"
+	"github.com/pkg/profile"
 	"os"
 )
 
 const (
-	targetFolder = "/home/mosheper/GolandProjects/FileCleanup/junkFiles"
+	targetFolder = "D:/junkFiles"
 	fileSize     = 10 * 1024 * 1024 // 10MB file size
 	numFiles     = 30000
 )
 
 func main() {
+	defer profile.Start(profile.MemProfile, profile.CPUProfile, profile.ProfilePath(".")).Stop()
+
 	if err := os.MkdirAll(targetFolder, 0755); err != nil {
 		fmt.Println("Error creating target folder:", err)
 		return
