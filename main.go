@@ -1,8 +1,10 @@
 package main
 
 import (
-	"fmt"
-	"log"
+	"github.com/fsnotify/fsnotify"
+	log "github.com/sirupsen/logrus"
+	"gopkg.in/natefinch/lumberjack.v2"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -11,25 +13,25 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
-
-	"github.com/fsnotify/fsnotify"
 )
 
 const (
-	targetFolder            = "E:/junkFiles"
-	retentionDays           = 30
-	deleteIntervalSeconds   = 3600 // Change this to desired interval in seconds (e.g., 3600 for 1 hour)
-	maxFolderSizeMB         = 256  // Maximum folder size in MB
-	maxFolderSizePercent    = 0    // Maximum folder size as a percentage of the total drive size
-	maxFolderPercentEnabled = true
-	checkSizeIntervalSecs   = 600 // Interval for checking folder size in seconds (e.g., 600 for every 10 minutes)
-	isDetailedLogEnabled    = false
+	targetFolder                      = "E:/junkFiles"
+	retentionDays                     = 30
+	deleteIntervalSeconds             = 3600 // Change this to desired interval in seconds (e.g., 3600 for 1 hour)
+	maxFolderSizeMB                   = 256  // Maximum folder size in MB
+	maxFolderSizePercent              = 2    // Maximum folder size as a percentage of the total drive size
+	maxFolderPercentEnabled           = true
+	maxFolderPercentFromAvailableSize = true
+	checkSizeIntervalSecs             = 5 // Interval for checking folder size in seconds (e.g., 600 for every 10 minutes)
+	isDetailedLogEnabled              = false
 )
 
 const (
 	KB = 1024
 	MB = 1024 * KB
 	GB = 1024 * MB
+	// TB the size TB is bytes
 	TB = 1024 * GB
 )
 
@@ -46,8 +48,25 @@ type FileInfo struct {
 }
 
 func main() {
+	lumberjackLogger := &lumberjack.Logger{
+		Filename:   "E:/FileCleanup/log/FileCleanup.log",
+		MaxSize:    1,
+		MaxBackups: 3,
+		MaxAge:     28,
+		Compress:   true,
+	}
+
+	// Fork writing into two outputs
+	multiWriter := io.MultiWriter(os.Stderr, lumberjackLogger)
+
+	logFormatter := new(log.TextFormatter)
+	logFormatter.TimestampFormat = time.DateTime // or RFC3339
+	logFormatter.FullTimestamp = true
+
+	log.SetFormatter(logFormatter)
+	log.SetOutput(multiWriter)
 	// Populate fileModTimes with existing files in the target folder
-	if err := populateFileInfoMap(); err != nil {
+	if err := populateFileInfoMap(targetFolder); err != nil {
 		log.Fatal("Error populating fileModTimes:", err)
 	}
 
@@ -69,6 +88,9 @@ func main() {
 			select {
 			case event := <-watcher.Events:
 				if event.Op&fsnotify.Create == fsnotify.Create {
+					if isDetailedLogEnabled {
+						log.Debugln("File creation notification :: File " + event.Name)
+					}
 					if strings.HasPrefix(event.Name, targetFolder) {
 						handleNewFile(event.Name)
 					}
@@ -95,16 +117,15 @@ func main() {
 	defer sizeTicker.Stop()
 
 	// Run the deletion process immediately and then periodically
-	deleteExcessFiles()
-	//deleteOldFiles()
-	//for {
-	//	select {
-	//	case <-ticker.C:
-	//		deleteOldFiles()
-	//	case <-sizeTicker.C:
-	//		go deleteExcessFiles()
-	//	}
-	//}
+	deleteOldFiles()
+	for {
+		select {
+		case <-ticker.C:
+			deleteOldFiles()
+		case <-sizeTicker.C:
+			go deleteExcessFiles(targetFolder)
+		}
+	}
 	<-make(chan struct{})
 }
 
@@ -129,7 +150,14 @@ func handleNewFile(filePath string) {
 	}
 }
 
-func populateFileInfoMap() error {
+func populateFileInfoMap(targetFolder string) error {
+	if _, err := os.Stat(targetFolder); os.IsNotExist(err) {
+		log.Warningln("Target folder does not exist:", targetFolder)
+		return nil
+	}
+	if isDetailedLogEnabled {
+		log.Traceln("Populating files to watch - folder:", targetFolder)
+	}
 	err := filepath.Walk(targetFolder, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -175,7 +203,7 @@ func deleteOldFiles() {
 	log.Printf("Total deleted files %d | Remaining folder size %d MB", deletedFiles, getFolderSizeMB())
 }
 
-func deleteExcessFiles() {
+func deleteExcessFiles(targetFolder string) {
 	mutex.Lock()
 	defer mutex.Unlock()
 
@@ -184,19 +212,22 @@ func deleteExcessFiles() {
 	var maxFolderSize int64
 	var numFilesToDelete int64
 	if maxFolderPercentEnabled {
-		folderSize = getFolderSizePercent()
+		var totalSize float64
+		folderSize, _, totalSize = getFolderSizePercent(targetFolder)
 		maxFolderSize = maxFolderSizePercent
-		numFilesToDelete = int64(float64(len(fileInfoMap)) * (float64(folderSize-maxFolderSizePercent) / float64(maxFolderSize)))
+		numFilesToDelete = int64(totalSize) * (folderSize - maxFolderSize) / 100 / getFileAvgSizeMB()
+		log.Printf("Folder size is %d%% out of allowed %d%%", folderSize, maxFolderSize)
 	} else {
 		folderSize = getFolderSizeMB()
 		maxFolderSize = maxFolderSizeMB
-		// Calculate the number of files to delete
+		log.Printf("Folder size is %f GB out of allowed %f GB", float64(folderSize)/GB, float64(maxFolderSizeMB)/GB)
 		numFilesToDelete = (folderSize - maxFolderSizeMB) / getFileAvgSizeMB()
 	}
 
 	deletedFiles := uint64(0)
 
 	if folderSize > maxFolderSize {
+		log.Printf("Deleting excess files - %d files", numFilesToDelete)
 		// Delete the oldest numFilesToDelete files
 		for range numFilesToDelete {
 			// Find the oldest file
@@ -211,19 +242,19 @@ func deleteExcessFiles() {
 
 			// Delete the oldest file
 			if err := os.Remove(oldestFile); err != nil {
-				log.Println("Error deleting file:", err)
+				log.Errorln("Error deleting file:", err)
 				break // Exit loop on error
 			}
 			deletedFiles++
 			if isDetailedLogEnabled {
-				log.Println("Deleted:", oldestFile)
+				log.Debugln("Deleted:", oldestFile)
 			}
 
 			// Update fileInfoMap after deletion
 			delete(fileInfoMap, oldestFile)
 		}
 	}
-	log.Println("Total deleted files", deletedFiles, "Remaining Folder size ", getFolderSizeMB(), "MB")
+	log.Println("Total deleted files", deletedFiles, "Remaining Folder size: ", getFolderSizeMB(), "MB")
 }
 
 func getFolderSizeMB() int64 {
@@ -234,7 +265,7 @@ func getFolderSizeMB() int64 {
 	}
 
 	// Convert bytes to MB
-	return size / (1024 * 1024)
+	return size / MB
 }
 
 func getFileAvgSizeMB() int64 {
@@ -249,27 +280,26 @@ func getFileAvgSizeMB() int64 {
 	return totalSize / int64(len(fileInfoMap)) / (1024 * 1024)
 }
 
-func getFolderSizePercent() int64 {
+func getFolderSizePercent(targetFolder string) (int64, float64, float64) {
 	var totalSize int64
-	switch runtime.GOOS {
+	var freeSize int64
+	switch goos := runtime.GOOS; goos {
 	case "windows":
 		kernelDLL := syscall.MustLoadDLL("kernel32.dll")
 		GetDiskFreeSpaceExW := kernelDLL.MustFindProc("GetDiskFreeSpaceExW")
 
-		var free, total, avail int64
+		var avail int64
 
-		path := "E:\\"
-		r1, r2, lastErr := GetDiskFreeSpaceExW.Call(
+		path := targetFolder
+		_, _, lastErr := GetDiskFreeSpaceExW.Call(
 			uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(path))),
-			uintptr(unsafe.Pointer(&free)),
-			uintptr(unsafe.Pointer(&total)),
+			uintptr(unsafe.Pointer(&freeSize)),
+			uintptr(unsafe.Pointer(&totalSize)),
 			uintptr(unsafe.Pointer(&avail)),
 		)
 
-		fmt.Println(r1, r2, lastErr)
-		fmt.Println("Free:", free, "Total:", total, "Available:", avail)
-		totalSize = total
-		break
+		log.Debugln(lastErr)
+		log.Debugf("Free: %f GB - Total: %f GB", float64(freeSize)/GB, float64(totalSize)/GB)
 
 	case "linux":
 		//TODO think about what do to in here. Maybe dev in dev_container would solve it
@@ -296,9 +326,15 @@ func getFolderSizePercent() int64 {
 		folderSize += fileInfo.Size
 	}
 
-	// Calculate the folder size as a percentage of the total drive size
-	folderSizePercent := int((float64(folderSize) / float64(totalSize)) * 100)
-	log.Printf("Folder size: %f GB | Total Drive size: %f GB", float64(folderSize)/GB, float64(totalSize)/GB)
+	log.Printf("Folder size: %f GB | Available size: %f GB | Total Drive size: %f GB", float64(folderSize)/GB, float64(freeSize)/GB, float64(totalSize)/GB)
 
-	return int64(folderSizePercent)
+	// Calculate the folder size as a percentage of the total drive size
+	var folderSizePercent int
+	if maxFolderPercentFromAvailableSize {
+		folderSizePercent = int((float64(folderSize) / float64(freeSize)) * 100)
+		return int64(folderSizePercent), float64(folderSize) / MB, float64(freeSize) / MB
+	}
+	folderSizePercent = int((float64(folderSize) / float64(totalSize)) * 100)
+	return int64(folderSizePercent), float64(folderSize) / MB, float64(totalSize) / MB
+
 }

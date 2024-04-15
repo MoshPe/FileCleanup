@@ -2,14 +2,15 @@ package main
 
 import (
 	"fmt"
+	"github.com/google/uuid"
 	"github.com/pkg/profile"
 	"os"
 )
 
 const (
-	targetFolder = "D:/junkFiles"
+	targetFolder = "E:/junkFiles"
 	fileSize     = 10 * 1024 * 1024 // 10MB file size
-	numFiles     = 30000
+	numFiles     = 4000
 )
 
 func main() {
@@ -21,7 +22,7 @@ func main() {
 	}
 
 	for i := 0; i < numFiles; i++ {
-		fileName := fmt.Sprintf("%s/file%d.txt", targetFolder, i)
+		fileName := fmt.Sprintf("%s/file-%d-%s.txt", targetFolder, i, uuid.New())
 		if err := generateFile(fileName, fileSize); err != nil {
 			fmt.Printf("Error generating file %s: %v\n", fileName, err)
 		} else {
