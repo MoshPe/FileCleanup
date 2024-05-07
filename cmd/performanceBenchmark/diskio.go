@@ -1,16 +1,23 @@
-package main
+package benchmark
 
 import (
 	"bufio"
-	"flag"
 	"fmt"
+	"log"
 	"os"
+	"path/filepath"
 	"time"
 )
 
-func writeFile(fSize int64) error {
-	fName := `D:/diskio` // test file
-	defer os.Remove(fName)
+func WriteFile(fSize int64, path string) error {
+	log.Println("Started benchmark single large file")
+	fName := filepath.Join(path, "singleFile") // test file
+	defer func(name string) {
+		err := os.Remove(name)
+		if err != nil {
+			log.Fatalln(err)
+		}
+	}(fName)
 	f, err := os.Create(fName)
 	if err != nil {
 		return err
@@ -49,15 +56,4 @@ func writeFile(fSize int64) error {
 		(float64(written)/1000000)/(float64(since)/float64(time.Second)),
 	)
 	return nil
-}
-
-var size = flag.Int("size", 8, "file size in GiB")
-
-func main() {
-	flag.Parse()
-	fSize := int64(*size) * (1024 * 1024 * 1024)
-	err := writeFile(fSize)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, fSize, err)
-	}
 }
