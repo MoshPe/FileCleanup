@@ -1,4 +1,4 @@
-EXE_NAME=FileCompare
+EXE_NAME=FileCleanup
 OUTPUT_FOLDER_WINDOWS=windows-build
 .PHONY: build
 build: ## Run tests

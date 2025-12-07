@@ -3,13 +3,8 @@ package benchmark
 import (
 	"FileCleanup/cmd"
 	_const "FileCleanup/const"
-	"bufio"
 	"errors"
 	"fmt"
-	"github.com/google/uuid"
-	log "github.com/sirupsen/logrus"
-	"github.com/spf13/cobra"
-	"gonum.org/v1/plot/vg"
 	"image/color"
 	"io"
 	"math/rand"
@@ -17,10 +12,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"sync"
 	"time"
 
-	"gonum.org/v1/plot"
-	"gonum.org/v1/plot/plotter"
+	log "github.com/sirupsen/logrus"
+	"github.com/spf13/cobra"
 )
 
 type Result struct {
@@ -46,6 +42,8 @@ var (
 	BufferSizeByte int64
 	NumberOfFiles  int64
 	Name           string
+	Parallel       bool
+	Mode           string
 )
 
 var (
@@ -66,13 +64,7 @@ func benchmarkCmd() *cobra.Command {
 				targetFolder: TestFilesPath,
 				color:        randomColor(),
 			}
-			if NumberOfFiles == 1 {
-				err := WriteFile(FileSizeMB, TestFilesPath)
-				if err != nil {
-					log.Fatalln(os.Stderr, FileSizeMB, err)
-				}
-				return
-			}
+
 			var (
 				totalWriteSpeed    float64
 				totalReadSpeed     float64
@@ -82,6 +74,8 @@ func benchmarkCmd() *cobra.Command {
 				totalMemUsage      float64
 				totalDeleteCPUTime float64
 				totalDeleteSpeed   float64
+				mutex              sync.Mutex // Required for Parallel safety
+				wg                 sync.WaitGroup
 			)
 			// Create target folder if it doesn't exist
 			if err := os.MkdirAll(result.targetFolder, os.ModePerm); err != nil {
@@ -89,14 +83,26 @@ func benchmarkCmd() *cobra.Command {
 				return
 			}
 
+			totalWriteReadOps := (FileSizeMB * NumberOfFiles) / BufferSizeByte
+			actualSizeMB := float64(FileSizeMB) / float64(_const.MB)
+
+			log.Println("Disk type:", result.disk)
+			log.Println("Parallel Mode:", Parallel) // Helpful log
+			log.Println("Buffer size in KB:", BufferSizeByte/_const.KB)
+			log.Println("Number of files:", NumberOfFiles)
+			log.Println("File size (KB):", FileSizeMB/_const.KB)
+			log.Println("Total File size (MB):", float64(FileSizeMB*NumberOfFiles)/_const.MB)
+			log.Println("Total File size (GB):", float64(FileSizeMB*NumberOfFiles)/_const.GB)
+
 			// Define file paths for benchmarking
 			filePaths := make([]string, 0, NumberOfFiles)
 			for i := 0; i < int(NumberOfFiles); i++ {
-				filePath := filepath.Join(result.targetFolder, fmt.Sprintf("file%s.dat", uuid.New()))
+				filePath := filepath.Join(result.targetFolder, fmt.Sprintf("file_%d.dat", i))
 				filePaths = append(filePaths, filePath)
 			}
 
 			log.Infoln("Starting IO benchmark on " + result.disk + "...")
+			log.Infof("Mode: %s | Parallel: %v\n", Mode, Parallel)
 
 			// Start CPU profile
 			cpuProfile, err := os.Create("cpu_" + result.disk + "_profile.prof")
@@ -110,98 +116,150 @@ func benchmarkCmd() *cobra.Command {
 				return
 			}
 			totalTime := time.Now()
-			startWrite = time.Now()
-			// Collect benchmark results
-			for _, path := range filePaths {
-				writeSpeed, writeIOPS, cpuTime, writeTime, err := measureWriteBenchmark(path)
-				if err != nil {
-					log.Errorf("Error writing file on %s: %v\n", path, err)
-					return
+			if Mode == "all" || Mode == "write" {
+				startWrite = time.Now()
+				log.Infoln("--- Starting Write Test ---")
+				// Collect benchmark results
+				for _, path := range filePaths {
+					worker := func(p string) {
+						writeSpeed, writeIOPS, cpuTime, writeTime, err := measureWriteBenchmark(path)
+						if err != nil {
+							log.Errorf("Error writing file on %s: %v\n", path, err)
+							return
+						}
+						mutex.Lock()
+						result.writeSpeeds = append(result.writeSpeeds, writeSpeed)
+						totalWriteSpeed += writeSpeed
+						result.writeIOPSs = append(result.writeIOPSs, writeIOPS)
+						totalWriteIOPS += writeIOPS
+						result.cpuTimes = append(result.cpuTimes, cpuTime)
+						totalCPUTime += cpuTime
+						result.writeTimes = append(result.writeTimes, writeTime)
+						mutex.Unlock()
+					}
+
+					if Parallel {
+						wg.Add(1)
+						go func(p string) {
+							defer wg.Done()
+							worker(p)
+						}(path)
+					} else {
+						worker(path)
+					}
 				}
-
-				result.writeSpeeds = append(result.writeSpeeds, writeSpeed)
-				totalWriteSpeed += writeSpeed
-				result.writeIOPSs = append(result.writeIOPSs, writeIOPS)
-				totalWriteIOPS += writeIOPS
-				result.cpuTimes = append(result.cpuTimes, cpuTime)
-				totalCPUTime += cpuTime
-				result.writeTimes = append(result.writeTimes, writeTime)
-			}
-			stopWriteTime := time.Now()
-			writeDuration := stopWriteTime.Sub(startWrite)
-
-			startRead = time.Now()
-			for _, path := range filePaths {
-				readSpeed, readIOPS, _, memUsage, readTime, err := measureReadBenchmark(path)
-				if err != nil {
-					log.Errorf("Error reading file on %s: %v\n", path, err)
-					return
+				if Parallel {
+					wg.Wait()
 				}
-
-				result.readSpeeds = append(result.readSpeeds, readSpeed)
-				totalReadSpeed += readSpeed
-				result.readIOPSs = append(result.readIOPSs, readIOPS)
-				totalReadIOPS += readIOPS
-				result.memUsages = append(result.memUsages, memUsage)
-				totalMemUsage += memUsage
-				result.readTimes = append(result.readTimes, readTime)
-
-			}
-
-			stopReadTime := time.Now()
-			readDuration := stopReadTime.Sub(startRead)
-
-			startDelete = time.Now()
-			for _, path := range filePaths {
-				deleteSpeed, cpuTime, deleteTime, err := measureDeleteBenchmark(path)
-				if err != nil {
-					log.Errorf("Error reading file on %s: %v\n", path, err)
-					return
-				}
-
-				result.deleteSpeeds = append(result.deleteSpeeds, deleteSpeed)
-				totalDeleteSpeed += deleteSpeed
-				result.cpuDeleteTimes = append(result.cpuDeleteTimes, cpuTime)
-				totalDeleteCPUTime += cpuTime
-				result.deleteTimes = append(result.deleteTimes, deleteTime)
+				stopWriteTime := time.Now()
+				writeDuration := stopWriteTime.Sub(startWrite)
+				actualSizeMB := float64(FileSizeMB) / float64(_const.MB)
+				totalDataMB := float64(NumberOfFiles) * actualSizeMB
+				avgWriteSpeed := totalDataMB / writeDuration.Seconds()
+				avgWriteIOPS := float64(totalWriteReadOps) / writeDuration.Seconds()
+				log.Println("Average Write Speed (MB/s):", avgWriteSpeed)
+				log.Println("Total Write time in seconds:", writeDuration.Seconds())
+				log.Println("Average Write IOPS:", avgWriteIOPS)
 			}
 
-			stopDeleteTime := time.Now()
-			deleteDuration := stopDeleteTime.Sub(startDelete)
+			if Mode == "all" || Mode == "read" {
+				startRead = time.Now()
+				for _, path := range filePaths {
+					worker := func(p string) {
+						readSpeed, readIOPS, _, memUsage, readTime, err := measureReadBenchmark(path)
+						if err != nil {
+							log.Errorf("Error reading file on %s: %v\n", path, err)
+							return
+						}
+
+						result.readSpeeds = append(result.readSpeeds, readSpeed)
+						totalReadSpeed += readSpeed
+						result.readIOPSs = append(result.readIOPSs, readIOPS)
+						totalReadIOPS += readIOPS
+						result.memUsages = append(result.memUsages, memUsage)
+						totalMemUsage += memUsage
+						result.readTimes = append(result.readTimes, readTime)
+					}
+
+					if Parallel {
+						wg.Add(1)
+						go func(p string) {
+							defer wg.Done()
+							worker(p)
+						}(path)
+					} else {
+						worker(path)
+					}
+				}
+
+				if Parallel {
+					wg.Wait()
+				}
+
+				stopReadTime := time.Now()
+				readDuration := stopReadTime.Sub(startRead)
+				avgReadSpeed := (float64(NumberOfFiles) * actualSizeMB) / readDuration.Seconds()
+				avgReadIOPS := float64(totalWriteReadOps) / readDuration.Seconds()
+				log.Println("Average Read IOPS:", avgReadIOPS)
+				log.Println("Average Read Speed (MB/s):", avgReadSpeed)
+				log.Println("Total Read time in seconds:", readDuration.Seconds())
+			}
+
+			if Mode == "all" || Mode == "delete" {
+				startDelete = time.Now()
+				for _, path := range filePaths {
+					worker := func(p string) {
+						deleteSpeed, cpuTime, deleteTime, err := measureDeleteBenchmark(path)
+						if err != nil {
+							log.Errorf("Error reading file on %s: %v\n", path, err)
+							return
+						}
+
+						result.deleteSpeeds = append(result.deleteSpeeds, deleteSpeed)
+						totalDeleteSpeed += deleteSpeed
+						result.cpuDeleteTimes = append(result.cpuDeleteTimes, cpuTime)
+						totalDeleteCPUTime += cpuTime
+						result.deleteTimes = append(result.deleteTimes, deleteTime)
+					}
+
+					if Parallel {
+						wg.Add(1)
+						go func(p string) {
+							defer wg.Done()
+							worker(p)
+						}(path)
+					} else {
+						worker(path)
+					}
+				}
+
+				if Parallel {
+					wg.Wait()
+				}
+
+				stopDeleteTime := time.Now()
+				deleteDuration := stopDeleteTime.Sub(startDelete)
+				avgDeleteSpeed := (float64(NumberOfFiles) * actualSizeMB) / deleteDuration.Seconds()
+				avgDeleteIOPS := float64(NumberOfFiles) / deleteDuration.Seconds()
+				avgDeleteCPUTime := totalDeleteCPUTime / float64(NumberOfFiles)
+
+				log.Println("Average Delete Speed (MB/s):", avgDeleteSpeed)
+				log.Println("Total Delete time in seconds:", deleteDuration.Seconds())
+				log.Println("Average Delete IOPS:", avgDeleteIOPS)
+				log.Println("Average Delete CPU Time (s):", avgDeleteCPUTime)
+			}
+
 			cpuProfile.Close()
 			pprof.StopCPUProfile()
 
 			// Calculate averages
-			avgWriteSpeed := float64(NumberOfFiles) * 10 / writeDuration.Seconds()
-			avgReadSpeed := float64(NumberOfFiles) * 10 / readDuration.Seconds()
-			totalWriteReadOps := (FileSizeMB * NumberOfFiles) / BufferSizeByte
-			avgWriteIOPS := float64(totalWriteReadOps) / writeDuration.Seconds()
-			avgReadIOPS := float64(totalWriteReadOps) / readDuration.Seconds()
 			avgCPUTime := totalCPUTime / float64(NumberOfFiles)
 			avgMemUsage := totalMemUsage / float64(NumberOfFiles)
-			avgDeleteSpeed := float64(NumberOfFiles) * 10 / deleteDuration.Seconds()
-			avgDeleteIOPS := float64(NumberOfFiles) / deleteDuration.Seconds()
-			avgDeleteCPUTime := totalDeleteCPUTime / float64(NumberOfFiles)
 
 			// Print statistics
-			log.Println("Disk type:", result.disk)
-			log.Println("Total operation Read, Write, Delete in seconds", time.Since(totalTime).Seconds())
-			log.Println("Number of files:", NumberOfFiles)
-			log.Println("File size (KB):", FileSizeMB/_const.KB)
-			log.Println("Total File size (MB):", float64(FileSizeMB*NumberOfFiles)/_const.MB)
-			log.Println("Total File size (GB):", float64(FileSizeMB*NumberOfFiles)/_const.GB)
-			log.Println("Average Write Speed (MB/s):", avgWriteSpeed)
-			log.Println("Total Write time in seconds:", writeDuration.Seconds())
-			log.Println("Average Read Speed (MB/s):", avgReadSpeed)
-			log.Println("Total Read time in seconds:", readDuration.Seconds())
-			log.Println("Average Delete Speed (MB/s):", avgDeleteSpeed)
-			log.Println("Total Delete time in seconds:", deleteDuration.Seconds())
-			log.Println("Average Write IOPS:", avgWriteIOPS)
-			log.Println("Average Read IOPS:", avgReadIOPS)
-			log.Println("Average Delete IOPS:", avgDeleteIOPS)
 			log.Println("Average CPU Time (s):", avgCPUTime)
-			log.Println("Average Delete CPU Time (s):", avgDeleteCPUTime)
 			log.Println("Average Memory Usage (bytes):", avgMemUsage)
+			log.Println("Total Benchmark Time:", time.Since(totalTime).Seconds())
 		},
 		Args: func(cmd *cobra.Command, args []string) error {
 			InitFilesPath()
@@ -225,9 +283,12 @@ func compareFlags(cmd *cobra.Command) {
 	}
 	cmd.Flags().StringVarP(&TestFilesPath, "path", "p", filepath.Join(home, ".fileCleanup", "benchmarkFiles"), fmt.Sprintf("Test files path. default: %s", filepath.Join(home, ".fileCleanup", "benchmarkFiles")))
 	cmd.Flags().Int64VarP(&FileSizeMB, "size", "s", 10, "File size in MB")
-	cmd.Flags().Int64VarP(&BufferSizeByte, "buffer", "b", 4096, "Buffer size in bytes")
+	// 4 * 1024 * 1024 = 4194304 bytes (4MB)
+	cmd.Flags().Int64VarP(&BufferSizeByte, "buffer", "b", 4194304, "Buffer size in bytes")
 	cmd.Flags().Int64VarP(&NumberOfFiles, "count", "c", 1000, "Number of files")
 	cmd.Flags().StringVarP(&Name, "name", "n", "", "Disk Name")
+	cmd.Flags().BoolVarP(&Parallel, "parallel", "m", false, "Run in parallel (true) or sequential (false)")
+	cmd.Flags().StringVarP(&Mode, "mode", "M", "all", "Benchmark mode: 'all', 'write', 'read', 'delete'")
 }
 
 func measureDeleteBenchmark(filePath string) (float64, float64, float64, error) {
@@ -314,23 +375,31 @@ func writeBenchmark(filePath string) (float64, error) {
 	}
 	defer file.Close()
 
+	// 1. Create the data pattern (A, B, C...)
 	buf := make([]byte, BufferSizeByte)
-	buf[len(buf)-1] = '\n'
-	w := bufio.NewWriterSize(file, len(buf))
+	for i := range buf {
+		buf[i] = byte(i % 255)
+	}
 
 	start := time.Now()
-	written := int64(0)
-	for i := int64(0); i < FileSizeMB; i += int64(len(buf)) {
-		nn, err := w.Write(buf)
-		written += int64(nn)
+
+	// 2. Write DIRECTLY to file (No bufio)
+	remainingBytes := FileSizeMB // Remember: FileSizeMB is actually total bytes in your code
+	for remainingBytes > 0 {
+		// If remaining bytes is smaller than buffer, slice the buffer
+		toWrite := buf
+		if int64(len(buf)) > remainingBytes {
+			toWrite = buf[:remainingBytes]
+		}
+
+		nn, err := file.Write(toWrite)
 		if err != nil {
 			return 0, err
 		}
+		remainingBytes -= int64(nn)
 	}
-	err = w.Flush()
-	if err != nil {
-		return 0, err
-	}
+
+	// 3. Force the OS to flush to disk (Critical for accurate benchmarking)
 	err = file.Sync()
 	if err != nil {
 		return 0, err
@@ -374,94 +443,6 @@ func getCpuInfo() float64 {
 }
 
 // plotMetrics creates and saves separate plots for each collected metric with axis labels
-func plotMetrics(results []Result) error {
-	// Create a separate plot for each metric
-	plots := make([]*plot.Plot, 9)
-
-	// Define the metrics names Write -> Read -> Delete
-	metricNames := []string{"Write Speed MB", "Write IOPS", "Write - CPU Time", "Read Speed MB", "Read IOPS", "Memory Usage", "Delete Speed MB", "Delete - CPU Time"}
-
-	// Create plots
-	for i, name := range metricNames {
-		plots[i] = plot.New()
-		plots[i].X.Label.Text = "Seconds"
-		plots[i].Y.Label.Text = name
-	}
-
-	for _, result := range results {
-		// Add data to plots
-		dataWrite := [][]float64{result.writeSpeeds, result.writeIOPSs, result.cpuTimes}
-		dataRead := [][]float64{result.readSpeeds, result.readIOPSs, result.memUsages}
-		dataDelete := [][]float64{result.deleteSpeeds, result.cpuDeleteTimes}
-		i := 0
-		for _, plotData := range dataWrite {
-			points := make(plotter.XYs, len(plotData))
-			for j := range points {
-				points[j].X = result.readTimes[j]
-				points[j].Y = plotData[j]
-			}
-			line, err := plotter.NewLine(points)
-			if err != nil {
-				return err
-			}
-			line.Color = result.color
-			plots[i].Add(line)
-
-			// Add legend and axis labels
-			plots[i].Legend.Add(result.disk, line)
-
-			i++
-		}
-
-		for _, plotData := range dataRead {
-			points := make(plotter.XYs, len(plotData))
-			for j := range points {
-				points[j].X = result.writeTimes[j]
-				points[j].Y = plotData[j]
-			}
-			line, err := plotter.NewLine(points)
-			if err != nil {
-				return err
-			}
-			line.Color = result.color
-			plots[i].Add(line)
-
-			// Add legend and axis labels
-			plots[i].Legend.Add(result.disk, line)
-
-			i++
-		}
-
-		for _, plotData := range dataDelete {
-			points := make(plotter.XYs, len(plotData))
-			for j := range points {
-				points[j].X = result.deleteTimes[j]
-				points[j].Y = plotData[j]
-			}
-			line, err := plotter.NewLine(points)
-			if err != nil {
-				return err
-			}
-			line.Color = result.color
-			plots[i].Add(line)
-
-			// Add legend and axis labels
-			plots[i].Legend.Add(result.disk, line)
-
-			i++
-		}
-
-	}
-
-	for i := range metricNames {
-		// Save the plots to a file.
-		if err := plots[i].Save(6*vg.Inch, 4*vg.Inch, fmt.Sprintf("metric_%s.png", metricNames[i])); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
 
 func randomColor() color.RGBA {
 	randGen := rand.New(rand.NewSource(time.Now().UnixNano()))

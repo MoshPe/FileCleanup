@@ -4,11 +4,12 @@ import (
 	constant "FileCleanup/const"
 	"FileCleanup/pkg"
 	"encoding/json"
-	log "github.com/sirupsen/logrus"
 	"os"
 	"runtime"
 	"syscall"
 	"unsafe"
+
+	log "github.com/sirupsen/logrus"
 )
 
 func getFolderSizeMB() int64 {

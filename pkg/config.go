@@ -3,9 +3,10 @@ package pkg
 import (
 	"encoding/json"
 	"errors"
-	log "github.com/sirupsen/logrus"
 	"os"
 	"path/filepath"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type DeleteConfig struct {
